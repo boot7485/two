@@ -1,3 +1,10 @@
+/**
+ * Copyright (c) 2025 OpenShort.link Contributors
+ * 
+ * Licensed under the Common Public Attribution License Version 1.0 (CPAL-1.0)
+ * See LICENSE file or https://opensource.org/license/cpal-1-0
+ */
+
 // Analytics aggregation service
 // Aggregates Analytics Engine data into D1 for long-term storage and querying
 // Note: With real-time aggregation enabled, this is mainly used for:

@@ -1,3 +1,10 @@
+/**
+ * Copyright (c) 2025 OpenShort.link Contributors
+ * 
+ * Licensed under the Common Public Attribution License Version 1.0 (CPAL-1.0)
+ * See LICENSE file or https://opensource.org/license/cpal-1-0
+ */
+
 // Database operations for system settings
 
 import type { Env, StatusCheckSettings, StatusCheckFrequency } from '../types';

@@ -1,4 +1,11 @@
 /**
+ * Copyright (c) 2025 OpenShort.link Contributors
+ * 
+ * Licensed under the Common Public Attribution License Version 1.0 (CPAL-1.0)
+ * See LICENSE file or https://opensource.org/license/cpal-1-0
+ */
+
+/**
  * Comprehensive country name to ISO 3166-1 alpha-2 code mappings
  * Supports: full names (with spaces), 2-letter codes, underscores, hyphens, aliases
  */
