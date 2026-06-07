@@ -11,15 +11,15 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import { authOrApiKeyMiddleware } from '../middleware/auth';
 import { requirePermission } from '../middleware/authorization';
-import { createLink } from '../db/links';
+import { createLink, deleteLink } from '../db/links';
 import { getDomainById } from '../db/domains';
 import { generateSlug } from '../utils/id';
 import { isValidUrl, isValidSlug, normalizeUrl, isReservedSlug } from '../utils/validation';
 import { checkSlugExists } from '../db/links';
 import { upsertGeoRedirect, upsertDeviceRedirect, getGeoRedirects, getDeviceRedirects,
          upsertCityRedirect, upsertOsRedirect, getCityRedirects, getOsRedirects } from '../db/linkRedirects';
-import { setLinkTags } from '../db/tags';
-import { getCategoryById } from '../db/categories';
+import { setLinkTags, listTags, createTag, getTagById } from '../db/tags';
+import { listCategories, createCategory, getCategoryById } from '../db/categories';
 import { setCachedLink } from '../services/cache';
 import { getEffectiveLinkRoute } from '../utils/route';
 
@@ -76,6 +76,80 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
             return c.json({ success: true, data: { success: 0, errors: 0, results: [] } });
         }
 
+        // #14: resolve a CSV "Tags" column of human-friendly NAMES (or existing IDs)
+        // into tag IDs, creating missing domain-scoped tags. Built once and reused
+        // across rows so a name typed in several rows maps to a single tag.
+        const tagNameToId = new Map<string, string>();
+        const knownTagIds = new Set<string>();
+        for (const t of await listTags(c.env, { domainId })) {
+            if (t.name) tagNameToId.set(t.name.toLowerCase(), t.id);
+            knownTagIds.add(t.id);
+        }
+        const MAX_NAME = 50; // matches createTagSchema / createCategorySchema
+        const resolveTagIds = async (values: string[]): Promise<string[]> => {
+            const ids: string[] = [];
+            for (const value of values) {
+                // Accept an existing tag ID as-is (backward compatible with ID-based CSVs)...
+                if (knownTagIds.has(value)) {
+                    ids.push(value);
+                    continue;
+                }
+                // ...including a global/cross-domain tag ID we didn't preload (verify it exists,
+                // so an ID-based CSV doesn't get turned into a literal "tag_..." name).
+                if (value.startsWith('tag_') && await getTagById(c.env, value)) {
+                    knownTagIds.add(value);
+                    ids.push(value);
+                    continue;
+                }
+                // ...otherwise treat it as a name: validate, then reuse if present, else create.
+                if (value.length > MAX_NAME) {
+                    throw new Error(`Tag name too long (max ${MAX_NAME}): ${value}`);
+                }
+                const key = value.toLowerCase();
+                let id = tagNameToId.get(key);
+                if (!id) {
+                    const created = await createTag(c.env, { name: value, domain_id: domainId });
+                    id = created.id;
+                    tagNameToId.set(key, id);
+                    knownTagIds.add(id);
+                }
+                ids.push(id);
+            }
+            // Dedupe so setLinkTags never inserts the same (link_id, tag_id) twice
+            // (e.g. "news, News" or an existing ID plus its name).
+            return [...new Set(ids)];
+        };
+
+        // #14: resolve a Category column of a NAME (or existing ID) into a category ID —
+        // reuse an existing category by name, else create it — so a CSV exported by this
+        // dashboard (Category column holds the name) round-trips instead of failing.
+        const catNameToId = new Map<string, string>();
+        const knownCatIds = new Set<string>();
+        for (const cat of await listCategories(c.env, { domainId })) {
+            if (cat.name) catNameToId.set(cat.name.toLowerCase(), cat.id);
+            knownCatIds.add(cat.id);
+        }
+        const resolveCategoryId = async (value: string): Promise<string> => {
+            if (knownCatIds.has(value)) return value;
+            // A global/cross-domain category ID we didn't preload: accept if it exists.
+            if (value.startsWith('cat_') && await getCategoryById(c.env, value)) {
+                knownCatIds.add(value);
+                return value;
+            }
+            if (value.length > MAX_NAME) {
+                throw new Error(`Category name too long (max ${MAX_NAME}): ${value}`);
+            }
+            const key = value.toLowerCase();
+            let id = catNameToId.get(key);
+            if (!id) {
+                const created = await createCategory(c.env, { name: value, domain_id: domainId });
+                id = created.id;
+                catNameToId.set(key, id);
+                knownCatIds.add(id);
+            }
+            return id;
+        };
+
         // Process rows
         const results = [];
         let successCount = 0;
@@ -89,6 +163,9 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
             // Skip empty rows
             if (Object.keys(row).length === 0) continue;
 
+            // Tracks a link created in this row so we can roll it back if a later
+            // step (tags/redirects/cache) fails — keeps each row all-or-nothing.
+            let createdLinkId: string | null = null;
             try {
                 // Extract data based on mapping or auto-detection
                 // The row is an object with keys as headers (if headers exist) or indices
@@ -102,6 +179,7 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
                 let tagsStr = row['tags'] || row['tag'];
                 let route = row['route'] || row['path_prefix'];
                 let categoryId = row['category_id'] || row['category'];
+                let redirectCodeStr = row['redirect_code'];
 
                 // If column mapping is provided, override
                 // Mapping format: { "csv_header": "field_name" }
@@ -115,7 +193,19 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
                         else if (fieldName === 'tags') tagsStr = row[csvHeader];
                         else if (fieldName === 'route') route = row[csvHeader];
                         else if (fieldName === 'category_id') categoryId = row[csvHeader];
+                        else if (fieldName === 'redirect_code') redirectCodeStr = row[csvHeader];
                     }
+                }
+
+                // Validate redirect code if provided (else default to 301). Without this,
+                // a mapped "Redirect Code" column would be silently ignored.
+                let redirectCode = 301;
+                if (redirectCodeStr !== undefined && String(redirectCodeStr).trim() !== '') {
+                    const parsed = parseInt(String(redirectCodeStr).trim(), 10);
+                    if (![301, 302, 307, 308].includes(parsed)) {
+                        throw new Error(`Invalid redirect code: ${redirectCodeStr} (allowed: 301, 302, 307, 308)`);
+                    }
+                    redirectCode = parsed;
                 }
 
                 if (!destinationUrl) {
@@ -142,18 +232,6 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
                 }
                 const effectiveRoute = getEffectiveLinkRoute(domain, route);
 
-                // Validate category if provided (stored in the dedicated column for joins/filters).
-                // Fail the row on an unknown category — same as POST /links and PUT /:id, so we
-                // don't silently drop the assignment while reporting success.
-                let validCategoryId: string | undefined = undefined;
-                if (categoryId) {
-                    const category = await getCategoryById(c.env, categoryId);
-                    if (!category) {
-                        throw new Error(`Category not found: ${categoryId}`);
-                    }
-                    validCategoryId = categoryId;
-                }
-
                 // Generate or validate slug
                 if (slug) {
                     if (!isValidSlug(slug)) {
@@ -177,6 +255,13 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
                     }
                 }
 
+                // Resolve category AFTER all pre-insert validation (slug etc.) so a row that
+                // fails validation never creates a stray category. Stored in its own column.
+                let validCategoryId: string | undefined = undefined;
+                if (categoryId) {
+                    validCategoryId = await resolveCategoryId(categoryId);
+                }
+
                 // Prepare metadata (route stored here; category goes in its own column)
                 let metadata: string | undefined = undefined;
                 if (effectiveRoute) {
@@ -190,19 +275,21 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
                     destination_url: destinationUrl,
                     title: title || undefined,
                     description: description || undefined,
-                    redirect_code: 301,
+                    redirect_code: redirectCode,
                     status: 'active',
                     click_count: 0,
                     unique_visitors: 0,
                     category_id: validCategoryId,
                     metadata,
                 });
+                createdLinkId = link.id;
 
-                // Handle tags
+                // Handle tags — resolve names (or existing IDs) to tag IDs (#14)
                 if (tagsStr) {
-                    const tags = tagsStr.split(',').map((t: string) => t.trim()).filter((t: string) => t.length > 0);
-                    if (tags.length > 0) {
-                        await setLinkTags(c.env, link.id, tags);
+                    const tagValues = tagsStr.split(',').map((t: string) => t.trim()).filter((t: string) => t.length > 0);
+                    if (tagValues.length > 0) {
+                        const tagIds = await resolveTagIds(tagValues);
+                        await setLinkTags(c.env, link.id, tagIds);
                     }
                 }
 
@@ -327,6 +414,16 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
                 results.push({ row: i, success: true, slug: link.slug });
 
             } catch (error: any) {
+                // Roll back a partially-created row: if the link was inserted but a
+                // later step failed, hard-delete it (FK ON DELETE CASCADE removes its
+                // tags/redirects) so a failed row leaves nothing behind.
+                if (createdLinkId) {
+                    try {
+                        await deleteLink(c.env, createdLinkId, true);
+                    } catch (cleanupErr) {
+                        console.error(`Import row ${i}: cleanup of link ${createdLinkId} failed:`, cleanupErr);
+                    }
+                }
                 errorCount++;
                 results.push({ row: i, success: false, error: error.message });
             }
@@ -342,6 +439,11 @@ importRouter.post('/', authOrApiKeyMiddleware, requirePermission('create_links')
         });
 
     } catch (error: any) {
+        // Preserve intended client errors (e.g. 400 "Domain ID is required", 404
+        // "Domain not found") instead of masking every failure as a 500.
+        if (error instanceof HTTPException) {
+            throw error;
+        }
         console.error('Import error:', error);
         throw new HTTPException(500, { message: error.message || 'Import failed' });
     }
