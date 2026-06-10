@@ -1,0 +1,35 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Backup .github
+        run: cp -r .github /tmp/github_backup
+
+      - name: Sync from upstream
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/boot7485/two.git
+          git remote add upstream https://github.com/idhamsy/openshortlink.git
+          git fetch upstream
+          git reset --hard upstream/main
+          rm -rf .github
+          cp -r /tmp/github_backup .github
+          git add -A
+          git diff --cached --quiet || git commit -m "Sync upstream, keep .github"
+          git push origin main --force
